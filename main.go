@@ -22,11 +22,11 @@ type (
 		Trace(string, ...interface{})
 	}
 
- 	Driver struct {
-		mutex sync.Mutex 
-		mutexes map[string]*sync.Mutex
-		dir string
-		log Logger
+	Driver struct {
+		rwMutex sync.RWMutex
+		mutexes map[string]*sync.RWMutex
+		dir     string
+		log     Logger
 	}
 )
 
@@ -34,159 +34,164 @@ type Options struct {
 	Logger
 }
 
-func New(dir string, options *Options)(*Driver, error){
-
+func New(dir string, options *Options) (*Driver, error) {
 	dir = filepath.Clean(dir)
 
 	opts := Options{}
-
 	if options != nil {
 		opts = *options
 	}
 
-	if opts.Logger != nil {
-		opts.Logger = lumber.NewConsoleLogger((lumber.INFO))
+	if opts.Logger == nil {
+		opts.Logger = lumber.NewConsoleLogger(lumber.INFO)
 	}
 
-	driver := Driver{
-		dir: dir, 
-		mutexes: make(map[string]*sync.Mutex),
-		log : opts.Logger,
+	driver := &Driver{
+		dir:     dir,
+		mutexes: make(map[string]*sync.RWMutex),
+		log:     opts.Logger,
 	}
 
 	if _, err := os.Stat(dir); err == nil {
 		opts.Logger.Debug("Using '%s' (database already exists)\n", dir)
-
-		return &driver, nil
+		return driver, nil
 	}
 
-	opts.Logger.Debug("Creating the Base at '%s' ....", dir)
-
-	return &driver, os.MkdirAll(dir, 0755)
+	opts.Logger.Debug("Creating the database at '%s' ....", dir)
+	return driver, os.MkdirAll(dir, 0755)
 }
 
-func (d* Driver) Write(collection, resource string, v interface{}) error {
-	if collection == ""{
-		return fmt.Errorf("Missing collection - No place to save")
+func (d *Driver) Write(collection, resource string, v interface{}) error {
+	if collection == "" {
+		return fmt.Errorf("missing collection - no place to save")
 	}
-
 	if resource == "" {
-		return fmt.Errorf("Missing resources - unable to save record (no name)")
+		return fmt.Errorf("missing resource - unable to save record (no name)")
 	}
 
 	mutex := d.getOrCreateMutex(collection)
 	mutex.Lock()
-
 	defer mutex.Unlock()
 
 	dir := filepath.Join(d.dir, collection)
-
-	fnlPath := filepath.Join(dir, resource + ".json")
-
-	tmpPath := fnlPath + ".temp"
+	finalPath := filepath.Join(dir, resource+".json")
+	tmpPath := finalPath + ".temp"
 
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err 
+		return err
 	}
 
 	b, err := json.MarshalIndent(v, "", "\t")
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to marshal JSON: %v", err)
 	}
 
 	b = append(b, byte('\n'))
 
-	if err := os.WriteFile(tmpPath, b, 0644) ; err != nil {
-		return err
-	} 
-
-	return os.Rename(tmpPath, fnlPath)
-}
-
-func (d *Driver) Read(collection , resource string, v interface{}) error {
-	if collection == "" {
-		return fmt.Errorf("Missing collection - no place to save ")
+	if err := os.WriteFile(tmpPath, b, 0644); err != nil {
+		return fmt.Errorf("failed to write temp file: %v", err)
 	}
 
+	return os.Rename(tmpPath, finalPath)
+}
+
+func (d *Driver) Read(collection, resource string, v interface{}) error {
+	if collection == "" {
+		return fmt.Errorf("missing collection")
+	}
 	if resource == "" {
-		return fmt.Errorf("Missing collection - no collection to save")
-	}
-	record := filepath.Join(d.dir , resource)
-
-	if _, err := stat(record); err != nil {
-		return nil
+		return fmt.Errorf("missing resource")
 	}
 
-	b, err := os.ReadFile(record + ".json")
+	mutex := d.getOrCreateMutex(collection)
+	mutex.RLock()
+	defer mutex.RUnlock()
 
+	recordPath := filepath.Join(d.dir, collection, resource+".json")
+	if _, err := os.Stat(recordPath); err != nil {
+		return fmt.Errorf("record not found: %v", err)
+	}
+
+	b, err := os.ReadFile(recordPath)
 	if err != nil {
-		return err 
+		return fmt.Errorf("failed to read file: %v", err)
 	}
 
-	return json.Unmarshal(b, &v)
+	return json.Unmarshal(b, v)
 }
 
-func (d *Driver) ReadAll(collection string)([]string, error) {
+func (d *Driver) ReadAll(collection string) ([]string, error) {
 	if collection == "" {
-		return nil, fmt.Errorf("Missing Collection - unable to read")
+		return nil, fmt.Errorf("missing collection")
 	}
+
+	mutex := d.getOrCreateMutex(collection)
+	mutex.RLock()
+	defer mutex.RUnlock()
 
 	dir := filepath.Join(d.dir, collection)
 
-	if _, err := stat(dir); err != nil {
-		return nil, err
+	if _, err := os.Stat(dir); err != nil {
+		return nil, fmt.Errorf("collection not found: %v", err)
 	}
 
-	files, _ := os.ReadDir(dir)
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read directory: %v", err)
+	}
 
-	var records []string 
-
+	var records []string
 	for _, file := range files {
 		b, err := os.ReadFile(filepath.Join(dir, file.Name()))
-
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to read file: %v", err)
 		}
-
 		records = append(records, string(b))
 	}
 
 	return records, nil
 }
 
-
-
-func (d *Driver) getOrCreateMutex(collection string) *sync.Mutex {
-
-	d.mutex.Lock()
-	defer d.mutex.Unlock()
-	m, ok := d.mutexes[collection]
-
-	if !ok {
-		m = &sync.Mutex{}
-		d.mutexes[collection] = m
+func (d *Driver) Delete(collection, resource string) error {
+	if collection == "" || resource == "" {
+		return fmt.Errorf("collection or resource name is missing")
 	}
 
+	mutex := d.getOrCreateMutex(collection)
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	path := filepath.Join(d.dir, collection, resource+".json")
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return fmt.Errorf("resource does not exist")
+	}
+
+	return os.Remove(path)
+}
+
+func (d *Driver) getOrCreateMutex(collection string) *sync.RWMutex {
+	d.rwMutex.Lock()
+	defer d.rwMutex.Unlock()
+
+	if m, exists := d.mutexes[collection]; exists {
+		return m
+	}
+
+	m := &sync.RWMutex{}
+	d.mutexes[collection] = m
 	return m
 }
 
-func stat(path string)(fi os.FileInfo, err error){
-	if fi, err = os.Stat(path); os.IsNotExist(err){
-		fi, err = os.Stat(path + ".json")
-	}
-	return 
-}
-
 type Address struct {
-	City string
-	State string 
+	City    string
+	State   string
 	Country string
 	Pincode string
 }
 
 type User struct {
-	Name string
-	Age json.Number
+	Name    string
+	Age     json.Number
 	Contact string
 	Company string
 	Address Address
@@ -196,9 +201,9 @@ func main() {
 	dir := "./"
 
 	db, err := New(dir, nil)
-
 	if err != nil {
-		fmt.Println("Error Occured", err)
+		fmt.Println("Error occurred:", err)
+		return
 	}
 
 	employees := []User{
@@ -207,41 +212,33 @@ func main() {
 		{"Prachi", "17", "3423251", "Aramco", Address{"Bhidaur", "Tamil Nadu", "India", "1321"}},
 	}
 
-	for _, value := range employees {
-		db.Write("users", value.Name, User{
-			Name : value.Name, 
-			Age : value.Age,
-			Contact : value.Contact,
-			Address: value.Address,
-		})
+	for _, emp := range employees {
+		if err := db.Write("users", emp.Name, emp); err != nil {
+			fmt.Println("Error writing user:", err)
+		}
 	}
-	
 
 	records, err := db.ReadAll("users")
 	if err != nil {
-		fmt.Println("Error Occurred", err)
+		fmt.Println("Error occurred:", err)
+		return
 	}
-	fmt.Println(records)
+	fmt.Println("Records:", records)
 
-	allUsers := []User{}
-
-	for _, f := range records {
-		employeesFound := User{}
-
-		if err := json.Unmarshal([]byte(f), &employeesFound); err != nil {
-			fmt.Println("Error Occurred", err)
+	var allUsers []User
+	for _, record := range records {
+		var user User
+		if err := json.Unmarshal([]byte(record), &user); err != nil {
+			fmt.Println("Error unmarshalling record:", err)
+			continue
 		}
-
-		allUsers = append(allUsers, employeesFound)
+		allUsers = append(allUsers, user)
 	}
 
-	fmt.Println((allUsers))
+	fmt.Println("All Users:", allUsers)
 
-	// if err := db.Delete("user", "Mrinal"); err != nil {
-	// 	fmt.Println("Error Occured", err)
-	// }
-	
-	// if err := db.Delete("user", ""); err != nil {
-	// 	fmt.Println("Error Occured", err)
+	// Example: Deleting a user
+	// if err := db.Delete("users", "Mrinal"); err != nil {
+	// 	fmt.Println("Error deleting user:", err)
 	// }
 }
